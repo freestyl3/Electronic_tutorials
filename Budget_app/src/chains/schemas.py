@@ -49,10 +49,6 @@ class ChainDetailRead(ChainShortRead):
     operations: list[OperationRead]
 
 
-class ChainOperationsUpdate(BaseModel):
-    operation_ids: list[uuid.UUID] = Field(description="ID операций")
-    category_id: uuid.UUID | None = Field(None, description="ID категории")
-
 class ChainUpdate(BaseModel, OperationDateValidator):
     description: str | None = Field(None, description="Необязательное описание")
     operation_ids: list[uuid.UUID] | None = Field(None, description="Операции в цепочке")

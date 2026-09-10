@@ -4,8 +4,7 @@ from fastapi import APIRouter, Response, Query
 
 from src.auth.dependencies import CurrentUserID
 from src.chains.schemas import (
-    ChainCreate, ChainDetailRead, ChainShortRead, ChainOperationsUpdate,
-    ChainUpdate
+    ChainCreate, ChainDetailRead, ChainShortRead, ChainUpdate
 )
 from src.chains.dependencies import ChainServiceDep
 
@@ -33,32 +32,6 @@ async def get_chain(
     user_id: CurrentUserID
 ):
     return await service.get_by_id(chain_id, user_id)
-    
-@router.post("/{chain_id}/operations/add", response_model=ChainDetailRead)
-async def add_operations_to_chain(
-    chain_id: uuid.UUID,
-    update_schema: ChainOperationsUpdate,
-    service: ChainServiceDep,
-    user_id: CurrentUserID
-):
-    return await service.add_operations_into_chain(
-        chain_id,
-        update_schema,
-        user_id
-    )
-    
-@router.post("/{chain_id}/operations/remove", response_model=ChainDetailRead)
-async def remove_operations_from_chain(
-    chain_id: uuid.UUID,
-    update_schema: ChainOperationsUpdate,
-    service: ChainServiceDep,
-    user_id: CurrentUserID
-):
-    return await service.remove_operations_from_chain(
-        chain_id,
-        update_schema,
-        user_id
-    )
 
 @router.patch("/{chain_id}", response_model=ChainDetailRead)
 async def update_chain(

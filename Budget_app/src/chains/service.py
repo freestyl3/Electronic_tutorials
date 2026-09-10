@@ -1,15 +1,16 @@
 import uuid
 from decimal import Decimal
 from collections import defaultdict
+from typing import Any
+
+from sqlalchemy.orm import joinedload
 
 from src.core.uow import IUnitOfWork
 from src.chains.repository import ChainRepository
 from src.operations.repository import OperationRepository
 from src.categories.user_categories.repository import UserCategoryRepository
 from src.accounts.repository import AccountRepository
-from src.chains.schemas import (
-    ChainMetadata, ChainCreate, ChainOperationsUpdate, ChainUpdate
-)
+from src.chains.schemas import ChainMetadata, ChainCreate, ChainUpdate
 from src.chains.models import Chain
 from src.common.enums import OperationType
 from src.operations.models import Operation
@@ -29,15 +30,15 @@ class ChainService:
     @property
     def chain_repo(self) -> ChainRepository:
         return self.uow.get_repo(ChainRepository)
-    
+
     @property
     def op_repo(self) -> OperationRepository:
         return self.uow.get_repo(OperationRepository)
-    
+
     @property
     def cat_repo(self) -> UserCategoryRepository:
         return self.uow.get_repo(UserCategoryRepository)
-    
+
     @property
     def acc_repo(self) -> AccountRepository:
         return self.uow.get_repo(AccountRepository)
@@ -48,20 +49,6 @@ class ChainService:
         if amount < 0:
             return OperationType.EXPENSE
         return None
-    
-    async def _update_operations(
-            self,
-            operation_uuids: list[uuid.UUID],
-            chain_id: uuid.UUID | None,
-            user_id: uuid.UUID
-    ) -> list[Operation]:
-        if operation_uuids:
-            return await self.op_repo.update_with_chain(
-                operation_uuids,
-                chain_id,
-                user_id
-            )
-        return []
 
     async def _validate_and_get_metadata(
             self,
@@ -69,7 +56,7 @@ class ChainService:
             user_id: uuid.UUID,
             chain_id: uuid.UUID | None = None,
             allow_free: bool = False
-    ) -> ChainMetadata:       
+    ) -> ChainMetadata:
         operations = await self.op_repo.get_operations_for_chain(
             operation_ids=operation_ids,
             user_id=user_id,
@@ -90,33 +77,34 @@ class ChainService:
 
         if OperationType.TRANSFER in unique_types:
             raise TransferNotAllowedInChainError()
-        
+
         return ChainMetadata(
             total_amount=total_amount,
             operations=operations,
             operations_count=operations_count,
             suggested_type=self._suggest_type(total_amount)
         )
-    
+
     async def _validate_and_get_category(
         self,
         prev_category: UserCategory | None,
         new_category_id: uuid.UUID | None,
-        prev_amount: Decimal,
-        delta: Decimal,
+        amount: Decimal,
         user_id: uuid.UUID
-    ) -> UserCategory | None:        
-        new_amount = prev_amount + delta
-        new_type = self._suggest_type(new_amount)
+    ) -> UserCategory | None:
+        new_type = self._suggest_type(amount)
 
         if new_type is None:
             return None
 
         if new_category_id:
-            category = await self.cat_repo.get_one_by(
-                id=new_category_id,
-                user_id=user_id
-            )
+            if prev_category and prev_category.id == new_category_id:
+                category = prev_category
+            else:
+                category = await self.cat_repo.get_one_by(
+                    id=new_category_id,
+                    user_id=user_id
+                )
             if not category:
                 raise UserCategoryNotFoundError()
             if category.type != new_type:
@@ -125,30 +113,17 @@ class ChainService:
                 )
             return category
 
-        prev_type = self._suggest_type(prev_amount)
+        if prev_category and prev_category.type != new_type:
+            raise UserCategoryTypeMismatchError(
+                message=f"Amount sign changed. Need category with type: {new_type}"
+            )
 
-        if prev_type != new_type:
+        if prev_category is None:
             raise UserCategoryTypeMismatchError(
                 message=f"Amount sign changed. Need category with type: {new_type}"
             )
 
         return prev_category
-    
-    async def _finalize_chain_update(
-            self,
-            chain: Chain,
-            new_category: UserCategory | None,
-            operations: list[Operation],
-            delta: Decimal
-    ) -> Chain:
-        if chain.category != new_category:
-            chain.category = new_category
-        
-        chain.operations_count = len(operations)
-        chain.amount += delta
-        chain.operations = operations
-
-        return chain
 
     async def create(
             self,
@@ -164,13 +139,13 @@ class ChainService:
             chain_id=None,
             allow_free=True
         )
-        
+
         data_dict = create_data.model_dump(exclude=["operation_ids",])
 
         if meta.suggested_type:
             if not create_data.category_id:
                 raise ValueError("Category is required for this chain sum")
-            
+
             category = await self.cat_repo.get_one_by(
                 id=create_data.category_id,
                 user_id=user_id
@@ -178,7 +153,7 @@ class ChainService:
 
             if not category:
                 raise UserCategoryNotFoundError()
-            
+
             if category.type != meta.suggested_type:
                 raise UserCategoryTypeMismatchError(
                     message=f"Required category type: {meta.suggested_type}"
@@ -191,17 +166,17 @@ class ChainService:
 
         chain = await self.chain_repo.create(data_dict, user_id)
 
-        await self._update_operations(
+        await self.op_repo.update_with_chain(
             create_data.operation_ids,
             chain.id,
             user_id
         )
 
         return await self.get_by_id(chain_id=chain.id, user_id=user_id)
-    
+
     async def get_all(self, user_id: uuid.UUID) -> list[Chain]:
         return list(await self.chain_repo.get_all_by(user_id))
-    
+
     async def get_by_id(
             self,
             chain_id: uuid.UUID,
@@ -216,7 +191,7 @@ class ChainService:
             raise ChainNotFoundError()
 
         return chain
-    
+
     async def update(
             self,
             chain_id: uuid.UUID,
@@ -224,43 +199,78 @@ class ChainService:
             user_id: uuid.UUID
     ) -> Chain:
         chain = await self.get_by_id(chain_id, user_id)
-        
-        update_data = update_schema.model_dump(exclude_unset=True)
 
-        if not update_data:
-            return chain
-        
+        amount = chain.amount
+
+        update_data = update_schema.model_dump(
+            exclude_unset=True,
+            exclude=["operation_ids", ]
+        )
+
+        operations = chain.operations
         category = chain.category
+        needs_category = category is not None
+        to_add_ids, to_remove_ids = [], []
 
-        if "category_id" in update_data:
-            if update_data["category_id"] is None and chain.amount != 0:
-                 raise UserCategoryTypeMismatchError(
-                     message=f"Required category type: {self._suggest_type(chain.amount)}"
-                 )
-            
-            new_category = await self._validate_and_get_category(
-                prev_category=chain.category,
-                new_category_id=update_data["category_id"],
-                prev_amount=chain.amount,
-                delta=0,
+        if update_schema.operation_ids is not None:
+            operations_update_data = await self.get_operations_data_for_update(
+                chain,
+                set(update_schema.operation_ids),
+                user_id
+            )
+            operations = operations_update_data["operations"]
+            amount = operations_update_data["amount"]
+            to_add_ids = operations_update_data["to_add_ids"]
+            to_remove_ids = operations_update_data["to_remove_ids"]
+
+            needs_category = amount != 0
+
+        if needs_category:
+            category_type = category.type if category else None
+            if category_type != self._suggest_type(amount) and "category_id" not in update_data:
+                raise UserCategoryTypeMismatchError(
+                    message=f"Required category type: {self._suggest_type(amount)}"
+                )
+            elif "category_id" in update_data:
+                new_category = await self._validate_and_get_category(
+                    prev_category=chain.category,
+                    new_category_id=update_data["category_id"],
+                    amount=amount,
+                    user_id=user_id
+                )
+
+                if category != new_category:
+                    category = new_category
+                    update_data["category_id"] = category.id if category else None
+        else:
+            category = None
+            update_data["category_id"] = None
+
+        if to_add_ids or to_remove_ids:
+            update_dict = {op_id: {"chain_id": chain.id} for op_id in to_add_ids}
+            to_remove_dict = {op_id: {"chain_id": None} for op_id in to_remove_ids}
+            update_dict.update(to_remove_dict)
+            await self.op_repo.batch_update(update_dict, user_id)
+
+            update_data["amount"] = amount
+            update_data["operations_count"] = len(operations)
+
+        if update_data:
+            updated = await self.chain_repo.update(
+                model_id=chain_id,
+                update_data=update_data,
                 user_id=user_id
             )
 
-            if new_category:
-                category = new_category
-                update_data["category_id"] = category.id
-        
-        updated = await self.chain_repo.update(
-            model_id=chain_id,
-            update_data=update_data,
-            user_id=user_id
-        )
+            updated.category = category
+            updated.operations = operations
+            updated.amount = amount
+            updated.operations_count = len(operations)
 
-        updated.category = category
-        updated.operations = chain.operations
-        
-        return updated
-    
+            return updated
+
+        return chain
+
     async def delete(
             self,
             chain_id: uuid.UUID,
@@ -288,113 +298,65 @@ class ChainService:
 
         await self.chain_repo.delete(model_id=chain_id, user_id=user_id)
         return True
-    
-    async def add_operations_into_chain(
-            self,
-            chain_id: uuid.UUID,
-            update_schema: ChainOperationsUpdate,
-            user_id: uuid.UUID
-    ) -> Chain:
-        chain = await self.get_by_id(chain_id, user_id)
 
-        requested_operations = await self.op_repo.get_operations_for_chain(
-            operation_ids=update_schema.operation_ids,
-            user_id=user_id,
-            chain_id=chain_id,
-            allow_free=True
-        )
+    async def get_operations_data_for_update(
+        self,
+        chain: Chain,
+        update_operation_ids: set[uuid.UUID],
+        user_id: uuid.UUID
+    ) -> dict[str, Any]:
+        if len(update_operation_ids) < 2:
+            raise NotEnoughOperationsForChainError()
 
-        if len(requested_operations) != len(set(update_schema.operation_ids)):
-            raise OperationsConflictError()
-        
-        unique_types = {operation.category.type for operation in requested_operations}
+        chain_operation_ids = {op.id for op in chain.operations}
 
-        if OperationType.TRANSFER in unique_types:
-            raise TransferNotAllowedInChainError()
+        if update_operation_ids == chain_operation_ids:
+            return {
+                "operations": chain.operations,
+                "amount": chain.amount,
+                "to_add_ids": [],
+                "to_remove_ids": []
+            }
 
-        to_add = [
-            operation for operation in requested_operations
-            if operation.chain_id is None
-        ]
+        amount = chain.amount
+        operations = chain.operations[:]
 
-        prev_amount = chain.amount
-        delta = sum(operation.amount for operation in to_add)
+        operation_ids_to_add = update_operation_ids - chain_operation_ids
+        operation_ids_to_remove = chain_operation_ids - update_operation_ids
 
-        new_category = await self._validate_and_get_category(
-            chain.category,
-            update_schema.category_id,
-            prev_amount,
-            delta,
-            user_id
-        )
-
-        if not to_add and chain.category_id == new_category:
-            return chain
-
-        new_operations = []
-
-        if to_add:
-            new_operations = await self._update_operations(
-                [operation.id for operation in to_add],
-                chain_id,
-                user_id
+        if operation_ids_to_add:
+            operations_to_add: list[Operation] = await self.op_repo.get_all_by(
+                user_id,
+                True,
+                joinedload(Operation.category),
+                joinedload(Operation.account),
+                id__in=operation_ids_to_add,
+                chain_id=None
             )
 
-        operations = chain.operations + new_operations
+            unique_types = {operation.category.type for operation in operations_to_add}
 
-        return await self._finalize_chain_update(
-            chain,
-            new_category,
-            operations,
-            delta
-        )
-        
-    async def remove_operations_from_chain(
-            self,
-            chain_id: uuid.UUID,
-            update_schema: ChainOperationsUpdate,
-            user_id: uuid.UUID
-    ) -> Chain | None:
-        chain = await self.get_by_id(chain_id, user_id)
-        
-        to_remove = [
-            op for op in chain.operations
-            if op.id in update_schema.operation_ids
-        ]
+            if OperationType.TRANSFER in unique_types:
+                raise TransferNotAllowedInChainError()
 
-        prev_amount = chain.amount
-        delta = -sum(operation.amount for operation in to_remove)
+            amount += sum(op.amount for op in operations_to_add)
+            operations.extend(operations_to_add)
 
-        new_category = await self._validate_and_get_category(
-            chain.category,
-            update_schema.category_id,
-            prev_amount,
-            delta,
-            user_id
-        )
+        if operation_ids_to_remove:
+            removed_operations = [
+                op for op in chain.operations
+                if op.id in operation_ids_to_remove
+            ]
+            amount -= sum(op.amount for op in removed_operations)
 
-        if not to_remove and chain.category_id == new_category:
-            return chain
-        
-        to_stay = [
-            op for op in chain.operations
-            if op.id not in update_schema.operation_ids
-        ]
+            operations = [
+                op for op in operations
+                if op.id not in operation_ids_to_remove
+            ]
 
-        if len(to_stay) < 2:
-            await self.delete(chain_id, user_id)
-            return None
-
-        if to_remove:
-            await self._update_operations(
-                [operation.id for operation in to_remove],
-                None,
-                user_id
-            )
-
-        return await self._finalize_chain_update(
-            chain,
-            new_category,
-            to_stay,
-            delta
-        )
+        return {
+            "operations": operations,
+            "amount": amount,
+            "to_add_ids": list(operation_ids_to_add),
+            "to_remove_ids": list(operation_ids_to_remove)
+        }

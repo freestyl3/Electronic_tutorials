@@ -1,11 +1,16 @@
 from decimal import Decimal
 import datetime as dt
 import uuid
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import mapped_column, Mapped, relationship
 from sqlalchemy import String, ForeignKey, Numeric, func, Index
 
 from src.database.base import Base
+
+if TYPE_CHECKING:
+    from src.categories.user_categories.models import UserCategory
+    from src.accounts.models import Account
 
 class Operation(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(precision=15, scale=2))
